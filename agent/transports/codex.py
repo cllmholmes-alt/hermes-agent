@@ -159,6 +159,19 @@ class ResponsesApiTransport(ProviderTransport):
             params.get("replay_encrypted_reasoning", True)
         )
 
+        # Hermes exposes GPT-5.6 ``-pro`` entries as high-effort modes.  The
+        # ChatGPT Codex backend does not accept those synthetic names as model
+        # IDs; on that route, send the real base model and force max reasoning.
+        codex_pro_mode = (
+            is_codex_backend
+            and model in {
+                "gpt-5.6-sol-pro",
+                "gpt-5.6-terra-pro",
+                "gpt-5.6-luna-pro",
+            }
+        )
+        wire_model = model.removesuffix("-pro") if codex_pro_mode else model
+
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
         # items captured from the response, and passed to the input
@@ -176,6 +189,8 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_enabled = False
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
+        if codex_pro_mode and reasoning_enabled:
+            reasoning_effort = "max"
 
         _effort_clamp = {"minimal": "low"}
         if "gpt-5.6" in (model or "").lower():
@@ -255,7 +270,7 @@ class ResponsesApiTransport(ProviderTransport):
         # ``openai-codex`` / ``gpt-5.5`` combo on chatgpt.com/backend-api/codex
         # (#32892) when the agent runs without external tools registered.
         kwargs = {
-            "model": model,
+            "model": wire_model,
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,

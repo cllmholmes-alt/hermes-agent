@@ -85,6 +85,46 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == wire_effort
 
+    @pytest.mark.parametrize("tier", ["sol", "terra", "luna"])
+    def test_codex_pro_mode_uses_base_model_with_max_reasoning(self, transport, tier):
+        """Hermes exposes ``-pro`` as a high-effort mode, not a backend slug.
+
+        The ChatGPT Codex endpoint rejects literal ``gpt-5.6-*-pro`` model IDs.
+        Preserve the user-facing mode while sending the real base model and the
+        strongest supported reasoning effort on the OAuth wire path.
+        """
+        kw = transport.build_kwargs(
+            model=f"gpt-5.6-{tier}-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        assert kw["model"] == f"gpt-5.6-{tier}"
+        assert kw.get("reasoning", {}).get("effort") == "max"
+
+    def test_codex_pro_mode_respects_explicit_reasoning_disable(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"enabled": False},
+        )
+        assert kw["model"] == "gpt-5.6-sol"
+        assert "reasoning" not in kw
+
+    def test_non_codex_responses_preserves_literal_pro_model(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol-pro",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=False,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        assert kw["model"] == "gpt-5.6-sol-pro"
+        assert kw.get("reasoning", {}).get("effort") == "low"
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
