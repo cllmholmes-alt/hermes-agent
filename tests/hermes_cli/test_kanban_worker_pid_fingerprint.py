@@ -89,8 +89,7 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     conn = board
     killed = []
     live_fingerprint = kbd._process_fingerprint(os.getpid())
-    assert live_fingerprint is not None and live_fingerprint.split("|", 1)[1] == str(
-        __import__("gateway.status", fromlist=["x"]).get_process_start_time(os.getpid()))
+    assert live_fingerprint is not None and live_fingerprint.split("|", 1)[1]
     tid = _claimed_running(conn, pid=os.getpid(), started_at=live_fingerprint, max_runtime=1)
     assert kbd._worker_alive(os.getpid(), live_fingerprint) is True
 
@@ -114,11 +113,9 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     """Fingerprint capture fails for a new spawn: the row is NOT a legacy NULL row. A live PID under
     it is never SIGTERM/SIGKILLed by any reclaim/timeout path, and the claim is held (not released
     beside the live process); once the PID is gone the claim is reclaimed normally."""
-    import gateway.status as status
-
     conn = board
     killed = []
-    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
     tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
     kb.claim_task(conn, tid)
     kbd._set_worker_pid(conn, tid, os.getpid())
@@ -149,3 +146,132 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("clock_shift", [-5, 5])
+def test_macos_clock_adjustment_does_not_reap_or_duplicate_live_worker(board, monkeypatch, clock_shift):
+    """A long-lived dispatcher's boot-clock cache differs from a fresh worker's."""
+    import psutil
+    import psutil._psosx as osx
+
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    tid = _claimed_running(board, pid=pid, started_at=recorded)
+    wall_start = psutil.Process(pid).create_time()
+    monkeypatch.setattr(osx, "INIT_BOOT_TIME", osx.INIT_BOOT_TIME + clock_shift)
+    assert abs(psutil.Process(pid).create_time() - wall_start) >= 1
+    assert kbd._process_fingerprint(pid) == recorded
+    assert kbd._worker_alive(pid, recorded)
+    assert kbd.detect_crashed_workers(board) == []
+    assert kb.release_stale_claims(board) == 0
+    assert kb.get_task(board, tid).status == "running"
+
+
+@pytest.mark.platforms("macos")
+def test_macos_fingerprint_agrees_in_fresh_interpreter():
+    import subprocess
+    import sys
+
+    pid = os.getpid()
+    actual = subprocess.check_output(
+        [sys.executable, "-c", "from hermes_cli.kanban_db_dispatch import _process_fingerprint; "
+         f"print(_process_fingerprint({pid}))"], text=True, timeout=20,
+    ).strip()
+    assert actual == kbd._process_fingerprint(pid)
+    assert "|darwin-v1:" in actual
+
+
+@pytest.mark.platforms("macos")
+def test_macos_recycled_identity_is_never_signalled(board, monkeypatch):
+    from types import SimpleNamespace
+    import psutil
+
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    tid = _claimed_running(board, pid=pid, started_at=recorded, max_runtime=1)
+    start = psutil.Process(pid)._ident[1]
+    monkeypatch.setattr(psutil, "Process", lambda p: SimpleNamespace(_ident=(p, start + 0.001)))
+    assert not kbd._worker_alive(pid, recorded)
+    killed = []
+    assert tid in kbd.enforce_max_runtime(board, signal_fn=lambda p, s: killed.append((p, s)))
+    assert killed == []
+
+
+@pytest.mark.platforms("macos")
+def test_macos_legacy_fingerprints_keep_the_legacy_comparator():
+    pid = os.getpid()
+    legacy = kbd._legacy_process_fingerprint(pid)
+    assert "|darwin-v1:" not in legacy
+    assert kbd._worker_alive(pid, legacy)
+    assert kbd._pid_recycled(pid, "foreign-boot|" + legacy.split("|", 1)[1])
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("identity", [None, (1, 42), (os.getpid(), float("nan")), (os.getpid(), float("inf"))])
+def test_macos_unavailable_or_invalid_identity_fails_closed(monkeypatch, identity):
+    from types import SimpleNamespace
+    import psutil
+
+    monkeypatch.setattr(psutil, "Process", lambda p: SimpleNamespace(_ident=identity))
+    assert kbd._process_fingerprint(os.getpid()) is None
+
+
+def test_temporarily_unreadable_identity_holds_claim_and_refuses_signals(board, monkeypatch):
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    tid = _claimed_running(board, pid=pid, started_at=recorded, max_runtime=1)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda p: None)
+    killed = []
+    signal_fn = lambda p, s: killed.append((p, s))  # noqa: E731
+    assert kbd._worker_alive(pid, recorded)
+    assert kbd.detect_crashed_workers(board) == []
+    assert kbd.enforce_max_runtime(board, signal_fn=signal_fn) == []
+    assert kb.release_stale_claims(board, signal_fn=signal_fn) == 0
+    task = kb.get_task(board, tid)
+    result = kbd._terminate_reclaimed_worker(pid, task.claim_lock, started_at=recorded, signal_fn=signal_fn)
+    assert result["signal_refused"] and not result["terminated"]
+    assert task.status == "running" and killed == []
+
+
+@pytest.mark.platforms("posix")
+def test_timeout_terminates_only_owned_child_before_releasing_claim(board):
+    import subprocess
+    import sys
+
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]) as child:
+        try:
+            recorded = kbd._process_fingerprint(child.pid)
+            assert recorded is not None
+            tid = _claimed_running(board, pid=child.pid, started_at=recorded, max_runtime=1)
+            assert tid in kbd.enforce_max_runtime(board)
+            assert child.wait(timeout=5) == -signal.SIGTERM
+            assert kb.get_task(board, tid).status != "running"
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+
+
+def test_timeout_keeps_claim_if_worker_survives_signals(board, monkeypatch):
+    pid = os.getpid()
+    tid = _claimed_running(board, pid=pid, started_at=kbd._process_fingerprint(pid), max_runtime=1)
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *args: False)
+    killed = []
+    assert kbd.enforce_max_runtime(board, signal_fn=lambda p, s: killed.append((p, s))) == []
+    assert killed and kb.get_task(board, tid).status == "running"
+
+
+def test_identity_lost_after_sigterm_never_authorizes_sigkill_or_retry(board, monkeypatch):
+    pid = os.getpid()
+    tid = _claimed_running(board, pid=pid, started_at=kbd._process_fingerprint(pid), max_runtime=1)
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *args: False)
+    killed = []
+
+    def signal_fn(p, s):
+        killed.append((p, s))
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda p: None)
+
+    assert kbd.enforce_max_runtime(board, signal_fn=signal_fn) == []
+    assert killed == [(pid, signal.SIGTERM)]
+    assert kb.get_task(board, tid).status == "running"

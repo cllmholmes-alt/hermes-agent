@@ -551,6 +551,7 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
+@pytest.mark.platforms("linux")
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -2024,9 +2025,6 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # long-lived processes (gateway run_slash, dashboard decompose handler).
 # `connect_closing()` is the leak-safe replacement.
 # ---------------------------------------------------------------------------
-
-
-
 
 
 

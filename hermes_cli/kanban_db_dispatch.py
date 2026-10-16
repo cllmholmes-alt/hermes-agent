@@ -26,6 +26,9 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_worker_identity import _legacy_process_fingerprint
+from hermes_cli.kanban_worker_identity import _process_fingerprint
+from hermes_cli.kanban_worker_identity import _worker_identity_matches
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -364,20 +367,6 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
-def _process_fingerprint(pid: int) -> Optional[str]:
-    """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
-    time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
-    survives a reboot could match an unrelated process with the same PID and the same tick value;
-    ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
-    from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import get_process_start_time
-    start = get_process_start_time(int(pid))
-    if start is None:
-        return None
-    return f"{current_instantiation_epoch()}|{start}"
-
-
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -390,7 +379,7 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    return not _pid_recycled(pid, started_at)
+    return _worker_identity_matches(pid, started_at) is not False
 
 
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
@@ -398,20 +387,7 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
     boot witness was added) compares the start time only."""
-    if started_at is None or not pid:
-        return False
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
-    if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
-    current = get_process_start_time(int(pid))
-    if current is None:
-        return True
-    try:
-        return not _start_times_agree(current, started_at)
-    except (TypeError, ValueError):
-        return True
+    return _worker_identity_matches(pid, started_at) is not True
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
@@ -469,12 +445,13 @@ def _terminate_reclaimed_worker(
     kill = _kill_fn(signal_fn)
     if kill is None:
         return info
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+    identity = _worker_identity_matches(pid, started_at)
+    if identity is None:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
         info["terminated"] = not _kb._pid_alive(pid)
         return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+    if _kb._pid_alive(pid) and identity is False:
         info["terminated"] = True
         info["pid_recycled"] = True
         return info
@@ -493,7 +470,7 @@ def _terminate_reclaimed_worker(
     if _poll_worker_exit(pid, started_at):
         info["terminated"] = True
         return info
-    if _worker_alive(pid, started_at):
+    if _worker_alive(pid, started_at) and not _pid_recycled(pid, started_at):
         if not _sigkill(kill, pid):
             return info
         info["sigkill"] = True
@@ -681,7 +658,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+        if _kb._pid_alive(pid) and _worker_identity_matches(pid, started_at) is None:
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
@@ -697,8 +674,18 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
             _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
+            if _worker_alive(pid, started_at) and not _pid_recycled(pid, started_at):
                 killed = _sigkill(kill, pid)
+
+        if _worker_alive(pid, started_at):
+            # A failed signal or an identity read lost during shutdown must not
+            # free the slot while the original worker may still be executing.
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now,
+                {"host_local": True, "termination_attempted": True, "terminated": False},
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
